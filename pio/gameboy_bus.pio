@@ -115,3 +115,16 @@ idle:
     in pins 24 ; shift in addr pins and data pins
     in null 24 ; shift data pins to right position and auto push
     .wrap
+
+
+.program gameboy_bus_mirror
+; Records every bus cycle with CS low, which covers 0xA000 to 0xFDFF (cartridge RAM, work RAM
+; and its echo). Reads and writes are both recorded: on a read the data bus carries the current
+; memory content, on a write the new one. Both keep a mirror of the memory up to date.
+; Every record is one auto-pushed word with A0 to A15 in bits 0-15 and D0 to D7 in bits 16-23.
+.wrap_target
+    wait 1 pin 29                        ; wait for clk to become high, a new bus cycle begins
+    wait 0 pin 31 [1]                    ; wait for cs to become low
+    wait 0 pin 29 [7]                    ; wait for second half of clk cycle, data is valid now
+    in pins 24                           ; sample addr pins + data pins, auto push
+    .wrap

@@ -77,11 +77,12 @@ use crate::gb_bootloader::GbBootloader;
 
 mod gb_pio;
 use gb_pio::{
-    GbDataOut, GbMbcCommands, GbPioPins, GbRamWrite, GbRomDetect, GbRomHigher, GbRomLower,
+    GbBusMirror, GbDataOut, GbMbcCommands, GbPioPins, GbRamWrite, GbRomDetect, GbRomHigher,
+    GbRomLower,
 };
 
 mod gb_dma;
-use gb_dma::{GbDmaCommandMachine, GbReadDmaConfig, GbReadSniffDmaConfig};
+use gb_dma::{GbBusMirrorDmaConfig, GbDmaCommandMachine, GbReadDmaConfig, GbReadSniffDmaConfig};
 
 mod gb_mbc;
 use gb_mbc::{Huc3, Mbc, Mbc1, Mbc3, Mbc5, MbcRamControl, NoMbc};
@@ -229,7 +230,14 @@ static GB_RTC_STATEPROVIDER: StaticCell<GbRtcStateProvider<SpinlockRawMutex<1>>>
 extern "C" {
     static mut _s_gb_rom_memory: u8;
     static mut _s_gb_save_ram: u8;
+    static mut _s_gb_bus_mirror: u8;
 }
+
+/// The bus mirror is a 64K window, GB address X is kept at offset X.
+const GB_BUS_MIRROR_SIZE: usize = 0x10000;
+/// GB work RAM, 0xC000 to 0xDFFF, as kept up to date by the bus mirror.
+const GB_WRAM_START: usize = 0xC000;
+const GB_WRAM_SIZE: usize = 0x2000;
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -285,7 +293,7 @@ async fn main(_spawner: Spawner) {
 
     let Pio {
         common: mut pio0,
-        sm0: _sm0_0,
+        sm0: sm0_0,
         sm1: sm0_1,
         sm2: sm0_2,
         sm3: sm0_3,
@@ -348,6 +356,7 @@ async fn main(_spawner: Spawner) {
     let mut gb_mbc_commands_pio = GbMbcCommands::new(&mut pio0, &pac::PIO0, sm0_1);
     let mut gb_ram_read_pio = GbRamRead::new(&mut pio0, &pac::PIO0, sm0_2);
     let mut gb_ram_write_pio = GbRamWrite::new(&mut pio0, &pac::PIO0, sm0_3);
+    let mut gb_bus_mirror_pio = GbBusMirror::new(&mut pio0, &pac::PIO0, sm0_0);
 
     info!("gpiobase: {}", pac::PIO1.gpiobase().read().gpiobase());
 
@@ -400,6 +409,22 @@ async fn main(_spawner: Spawner) {
     gb_rom_detect_pio.start();
     gb_ram_read_pio.start();
     gb_ram_write_pio.start();
+
+    // Mirror of the GB memory on 0xA000 to 0xFDFF, read by the host tether on the second core.
+    // It runs from here on, so it also follows the bootloader menu and the boot of the game.
+    let gb_bus_mirror = ptr::addr_of_mut!(_s_gb_bus_mirror);
+    unsafe {
+        ptr::write_bytes(gb_bus_mirror, 0, GB_BUS_MIRROR_SIZE);
+    }
+    let _bus_mirror_dma = GbBusMirrorDmaConfig::new(
+        p.DMA_CH8.into(),
+        p.DMA_CH13.into(),
+        p.DMA_CH14.into(),
+        p.DMA_CH15.into(),
+        &gb_bus_mirror_pio,
+        gb_bus_mirror,
+    );
+    gb_bus_mirror_pio.start();
 
     // SPI clock needs to be running at <= 400kHz during initialization of sd card
     let mut config = spi::Config::default();
@@ -744,12 +769,19 @@ async fn usb_task(mut usb: MyUsbDevice) -> ! {
 /// * `p` answers `pong`
 /// * `v` answers the tether protocol version
 /// * `s` answers `menu` or `game`, depending on what the first core is doing
+/// * `w` answers the work RAM (0xC000 to 0xDFFF) as 8192 raw bytes
+/// * `d` answers `stall 0` or `stall 1`. 1 means the bus mirror lost records since the last `d`
 ///
 /// No timers are used in here on purpose. The timer interrupt is handled on the first core
 /// and does not fire anymore once a game is running.
 #[embassy_executor::task]
 async fn tether_task(mut class: CdcAcmClass<'static, MyUsbDriver>) -> ! {
     let mut buf = [0u8; 64];
+
+    // Copy of the work RAM, taken in one go so it is as close to a single point in time as
+    // possible, before it is sent out in USB packets.
+    static WRAM_SNAPSHOT: StaticCell<[u8; GB_WRAM_SIZE]> = StaticCell::new();
+    let snapshot = WRAM_SNAPSHOT.init([0u8; GB_WRAM_SIZE]);
 
     loop {
         class.wait_connection().await;
@@ -764,12 +796,26 @@ async fn tether_task(mut class: CdcAcmClass<'static, MyUsbDriver>) -> ! {
             for command in &buf[..len] {
                 let reply: &[u8] = match *command {
                     b'p' => b"pong\n",
-                    b'v' => b"croco-v2 tether 1\n",
+                    b'v' => b"croco-v2 tether 2\n",
                     b's' => {
                         if GAME_RUNNING.load(Ordering::Acquire) {
                             b"game\n"
                         } else {
                             b"menu\n"
+                        }
+                    }
+                    b'w' => {
+                        take_wram_snapshot(snapshot);
+                        if write_all(&mut class, snapshot).await.is_err() {
+                            break 'connection;
+                        }
+                        continue;
+                    }
+                    b'd' => {
+                        if GbBusMirror::<PIO0, 0>::take_stalled(&pac::PIO0) {
+                            b"stall 1\n"
+                        } else {
+                            b"stall 0\n"
                         }
                     }
                     b'\r' | b'\n' => continue,
@@ -784,6 +830,28 @@ async fn tether_task(mut class: CdcAcmClass<'static, MyUsbDriver>) -> ! {
 
         info!("tether disconnected");
     }
+}
+
+/// Copies the work RAM out of the bus mirror. The mirror is written by DMA behind the back of the
+/// compiler, so it is read with volatile accesses.
+fn take_wram_snapshot(snapshot: &mut [u8; GB_WRAM_SIZE]) {
+    let wram = unsafe { (ptr::addr_of!(_s_gb_bus_mirror) as *const u32).add(GB_WRAM_START / 4) };
+    for (i, chunk) in snapshot.chunks_exact_mut(4).enumerate() {
+        let word = unsafe { ptr::read_volatile(wram.add(i)) };
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+}
+
+/// Sends a buffer of any size over the tether, split into USB packets.
+async fn write_all(
+    class: &mut CdcAcmClass<'static, MyUsbDriver>,
+    data: &[u8],
+) -> Result<(), embassy_usb::driver::EndpointError> {
+    let packet_size = class.max_packet_size() as usize;
+    for packet in data.chunks(packet_size) {
+        class.write_packet(packet).await?;
+    }
+    Ok(())
 }
 
 #[embassy_executor::task]

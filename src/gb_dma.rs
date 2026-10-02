@@ -240,6 +240,122 @@ impl<'d> GbReadSniffDmaConfig<'d> {
     }
 }
 
+// last record received from the bus mirror PIO-SM: A0 to A15 in bits 0-15, D0 to D7 in bits 16-23
+static mut BUS_MIRROR_RECORD: u32 = 0;
+// write pointer into the bus mirror. The upper half holds the base of the 64K window the mirror
+// lives in, the lower half gets replaced by the GB address of every record.
+static mut BUS_MIRROR_WRITE_PTR: u32 = 0;
+
+/// Keeps a copy of everything the GB reads or writes in 0xA000 to 0xFDFF.
+///
+/// The GB memory map is mapped 1:1 into a 64K window of the RP2350 memory, so a record for GB
+/// address X updates the byte at window + X. Because the GB address only ever replaces the lower
+/// half of the write pointer, even a glitched record cannot make the DMA write outside the window.
+pub struct GbBusMirrorDmaConfig<'d> {
+    _dma_ch0: Peri<'d, AnyChannel>,
+    _dma_ch1: Peri<'d, AnyChannel>,
+    _dma_ch2: Peri<'d, AnyChannel>,
+    _dma_ch3: Peri<'d, AnyChannel>,
+}
+
+impl<'d> GbBusMirrorDmaConfig<'d> {
+    /// `window` has to be 64K aligned and 64K long.
+    pub fn new(
+        dma0: Peri<'d, AnyChannel>,
+        dma1: Peri<'d, AnyChannel>,
+        dma2: Peri<'d, AnyChannel>,
+        dma3: Peri<'d, AnyChannel>,
+        record_read_target: &dyn DmaReadTarget<ReceivedWord = u32>,
+        window: *mut u8,
+    ) -> Self {
+        let window_base = window as u32;
+        assert!(window_base & 0xFFFF == 0, "bus mirror is not 64K aligned");
+
+        let record_addr = ptr::addr_of_mut!(BUS_MIRROR_RECORD) as u32;
+        let write_ptr_addr = ptr::addr_of_mut!(BUS_MIRROR_WRITE_PTR) as u32;
+        unsafe {
+            ptr::write_volatile(ptr::addr_of_mut!(BUS_MIRROR_WRITE_PTR), window_base);
+        }
+
+        let p0 = dma0.regs();
+        let p1 = dma1.regs();
+        let p2 = dma2.regs();
+        let p3 = dma3.regs();
+
+        /* setup channel 3, which reads the data byte of the record and writes it into the mirror. Its write addr and trigger come from channel 2. It triggers channel 0 again, so it can wait for the next record */
+        p3.trans_count().write(|w| {
+            w.set_count(1);
+        });
+        p3.read_addr().write_value(record_addr + 2);
+        let mut dma3_cfg = pac::dma::regs::CtrlTrig(0);
+        dma3_cfg.set_incr_read(false);
+        dma3_cfg.set_incr_write(false);
+        dma3_cfg.set_treq_sel(pac::dma::vals::TreqSel::PERMANENT);
+        dma3_cfg.set_chain_to(dma0.number());
+        dma3_cfg.set_data_size(pac::dma::vals::DataSize::SIZE_BYTE);
+        dma3_cfg.set_en(true);
+        p3.al1_ctrl().write_value(dma3_cfg.0);
+
+        /* setup channel 2, which reads the complete write pointer and writes it into the write addr of channel 3, while triggering it */
+        p2.trans_count().write(|w| {
+            w.set_count(1);
+        });
+        p2.read_addr().write_value(write_ptr_addr);
+        p2.write_addr()
+            .write_value(p3.al2_write_addr_trig().as_ptr() as u32);
+        let mut dma2_cfg = pac::dma::regs::CtrlTrig(0);
+        dma2_cfg.set_incr_read(false);
+        dma2_cfg.set_incr_write(false);
+        dma2_cfg.set_treq_sel(pac::dma::vals::TreqSel::PERMANENT);
+        dma2_cfg.set_chain_to(dma2.number()); // chain to itself -> disable
+        dma2_cfg.set_data_size(pac::dma::vals::DataSize::SIZE_WORD);
+        dma2_cfg.set_en(true);
+        p2.al1_ctrl().write_value(dma2_cfg.0);
+
+        /* setup channel 1, which copies the GB addr of the record into the lower half of the write pointer. The upper half keeps the window base */
+        p1.trans_count().write(|w| {
+            w.set_count(1);
+        });
+        p1.read_addr().write_value(record_addr);
+        p1.write_addr().write_value(write_ptr_addr);
+        let mut dma1_cfg = pac::dma::regs::CtrlTrig(0);
+        dma1_cfg.set_incr_read(false);
+        dma1_cfg.set_incr_write(false);
+        dma1_cfg.set_treq_sel(pac::dma::vals::TreqSel::PERMANENT);
+        dma1_cfg.set_chain_to(dma2.number());
+        dma1_cfg.set_data_size(pac::dma::vals::DataSize::SIZE_HALFWORD);
+        dma1_cfg.set_en(true);
+        p1.al1_ctrl().write_value(dma1_cfg.0);
+
+        /* setup channel 0, which reads a record from the RX FIFO on DREQ and stores it. Trigger it, so it will start on DREQ */
+        p0.trans_count().write(|w| {
+            w.set_count(1);
+        });
+        p0.read_addr()
+            .write_value(record_read_target.rx_address_count().0);
+        p0.write_addr().write_value(record_addr);
+        p0.ctrl_trig().write(|w| {
+            w.set_incr_read(false);
+            w.set_incr_write(false);
+            w.set_treq_sel(pac::dma::vals::TreqSel::from(
+                record_read_target
+                    .rx_treq()
+                    .unwrap_or(pac::dma::vals::TreqSel::PERMANENT as u8),
+            ));
+            w.set_chain_to(dma1.number());
+            w.set_data_size(pac::dma::vals::DataSize::SIZE_WORD);
+            w.set_en(true);
+        });
+
+        Self {
+            _dma_ch0: dma0,
+            _dma_ch1: dma1,
+            _dma_ch2: dma2,
+            _dma_ch3: dma3,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C, packed(1))]
 struct DmaCommand {

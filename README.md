@@ -31,11 +31,40 @@ keeps answering while a game is running. Every byte sent to it is one command:
 | `p` | `pong` |
 | `v` | version of the tether protocol |
 | `s` | `menu` while the ROM selection is shown, `game` once a ROM is running |
+| `w` | the work RAM, 0xC000 to 0xDFFF, as 8192 raw bytes |
+| `d` | `stall 1` if the work RAM mirror lost bus cycles since the last `d`, otherwise `stall 0` |
 
 `tools/tether_ping.py` polls the status once a second:
 ```
 python3 tools/tether_ping.py /dev/cu.usbmodemXXXX
 ```
+
+### Work RAM mirror
+Most of the state of a game lives in its work RAM. On the original Game Boy the work RAM sits on the
+same bus as the cartridge and shares its CS line, which is low for every access to 0xA000 to 0xFDFF.
+A PIO state machine records every bus cycle with CS low, reads and writes alike, as address plus data.
+A read shows the current content of the memory and a write the new one, so both keep the copy up to
+date. A chain of four DMA channels writes each recorded byte into a 64K window of the RP2350 memory, at
+the same offset as its GB address. This needs no CPU time, so it keeps running while a game is served.
+
+`tools/wram_mirror.py` reads the mirror:
+```
+python3 tools/wram_mirror.py /dev/cu.usbmodemXXXX dump     # hexdump of 0xC000 to 0xDFFF
+python3 tools/wram_mirror.py /dev/cu.usbmodemXXXX watch    # print the bytes that change
+python3 tools/wram_mirror.py /dev/cu.usbmodemXXXX verify   # check against the test ROM
+```
+
+To check the mirror, build the test ROM with `tools/mirror_test_rom/build.sh` (needs `GBDK_PATH`), put
+`build/mirror_test.gb` on the SD card, start it and run `verify`. The ROM rewrites 0xC400 to 0xDBFF with
+a known pattern once a second, and `verify` compares every byte of the mirror against it.
+
+Limits:
+- High RAM (0xFF80 to 0xFFFE), the IO registers and video RAM are not on the cartridge bus and cannot
+  be mirrored.
+- The mirror only knows what was accessed since the cartridge powered up. Games clear their work RAM
+  at boot, so it is complete once a game has started.
+- On a Game Boy Color the work RAM is banked and it is not known yet whether its accesses show up on
+  the cartridge bus. The mirror is meant for the original Game Boy and the Pocket.
 
 ## How does it work?
 The ROM is loaded from the sd card to the Hyperram connected to he microcontroller.
