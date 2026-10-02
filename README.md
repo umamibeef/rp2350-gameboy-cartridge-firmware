@@ -22,6 +22,21 @@ This command will send the cartridge into bootloader and flashes a new ELF from 
 picotool load -u -v -x -t elf target/thumbv8m.main-none-eabihf/release/rp2350-gameboy-cartridge -f
 ```
 
+## Host tether
+The cartridge shows up as a USB serial port next to the picotool interface. The USB device runs on the second core, so the port
+keeps answering while a game is running. Every byte sent to it is one command:
+
+| Command | Answer |
+| --- | --- |
+| `p` | `pong` |
+| `v` | version of the tether protocol |
+| `s` | `menu` while the ROM selection is shown, `game` once a ROM is running |
+
+`tools/tether_ping.py` polls the status once a second:
+```
+python3 tools/tether_ping.py /dev/cu.usbmodemXXXX
+```
+
 ## How does it work?
 The ROM is loaded from the sd card to the Hyperram connected to he microcontroller.
 The RP2350B has 12 PIO state-machines which are like small co-processors which can run arbitrary code. They are designed to be efficient in IO operations.

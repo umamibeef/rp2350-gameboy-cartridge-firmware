@@ -35,6 +35,10 @@ use embassy_rp::{bind_interrupts, clocks, config as rpconfig, otp, pac, spi, Per
 
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
 
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
+
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcAcmState};
 use embassy_usb::msos::{self, windows_version};
 use embassy_usb::{Config, UsbDevice};
 
@@ -52,6 +56,7 @@ use rtcc::DateTime;
 use smart_leds::RGB8;
 
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::{ptr, str};
 
 use arrayvec::ArrayString;
@@ -176,8 +181,34 @@ static VOLUME_MANAGER: StaticCell<VolumeManagerType> = StaticCell::new();
 
 static LOADED_ROM_INFO: StaticCell<RomInfo> = StaticCell::new();
 
-static mut CORE1_STACK: Stack<4096> = Stack::new();
+static mut CORE1_STACK: Stack<8192> = Stack::new();
 static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
+
+type RtcType = Mcp795xx<
+    SpiDeviceWithConfig<
+        'static,
+        SpinlockRawMutex<0>,
+        spi::Spi<'static, SPI0, Blocking>,
+        Output<'static>,
+    >,
+>;
+
+/// Everything the second core needs to offer the savegame services for the running game.
+/// Handed over by the first core once a ROM got selected in the bootloader.
+struct GameServices {
+    button_pin: Peri<'static, AnyPin>,
+    led: &'static mut Ws2812Spi<'static, SPI1>,
+    volume_mgr: &'static mut VolumeManagerType<'static>,
+    rom_info: &'static RomInfo,
+    saveram_memory: &'static [u8],
+    rtc: &'static mut RtcType,
+    rtc_state_provider: &'static mut GbRtcStateProvider<'static, SpinlockRawMutex<1>>,
+}
+
+static GAME_SERVICES: Signal<CriticalSectionRawMutex, GameServices> = Signal::new();
+
+/// Set by the first core right before it masks its interrupts and starts serving the game.
+static GAME_RUNNING: AtomicBool = AtomicBool::new(false);
 
 static SPI_BUS: StaticCell<SpinlockMutex<0, RefCell<spi::Spi<SPI0, Blocking>>>> = StaticCell::new();
 
@@ -201,7 +232,7 @@ extern "C" {
 }
 
 #[embassy_executor::main]
-async fn main(spawner: Spawner) {
+async fn main(_spawner: Spawner) {
     embassy_rp::pac::SIO.spinlock(31).write_value(1);
     let mut rp_config = rpconfig::Config::default();
     let pll_config = rp_config
@@ -278,78 +309,27 @@ async fn main(spawner: Spawner) {
 
     let ws2812 = WS2812.init(Ws2812Spi::new(p.SPI1, p.PIN_47));
 
-    // Create the driver, from the HAL.
-    let driver = Driver::new(p.USB, Irqs);
-
     let serialnum = otp::get_chipid().unwrap();
-    let serial = {
+    let serial: &'static str = {
         static SERIALBUF: StaticCell<ArrayString<16>> = StaticCell::new();
-        SERIALBUF.init(ArrayString::<16>::new())
-    };
-    core::fmt::write(serial, format_args!("{:X}", serialnum)).unwrap();
-
-    // Create embassy-usb Config
-    // Create a USB device RPI Vendor ID and on of these Product ID:
-    // https://github.com/raspberrypi/picotool/blob/master/picoboot_connection/picoboot_connection.c#L23-L27
-    let mut config = Config::new(0x2e8a, 0x0009);
-    config.manufacturer = Some("Croco");
-    config.product = Some("Cartridge V2");
-    config.serial_number = Some(serial.as_str());
-    config.max_power = 100;
-    config.max_packet_size_0 = 64;
-
-    // // Required for windows compatibility.
-    // // https://developer.nordicsemi.com/nRF_Connect_SDK/doc/1.9.1/kconfig/CONFIG_CDC_ACM_IAD.html#help
-    config.device_class = 0xEF;
-    config.device_sub_class = 0x02;
-    config.device_protocol = 0x01;
-    config.composite_with_iads = true;
-
-    let picotool = {
-        static PICOTOOL: StaticCell<PicotoolReset> = StaticCell::new();
-        let picotool = PicotoolReset::new();
-        PICOTOOL.init(picotool)
+        let serial = SERIALBUF.init(ArrayString::<16>::new());
+        core::fmt::write(serial, format_args!("{:X}", serialnum)).unwrap();
+        serial.as_str()
     };
 
-    // Create embassy-usb DeviceBuilder using the driver and config.
-    // It needs some buffers for building the descriptors.
-    let mut builder = {
-        static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
-        static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
-        static MSOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
-        static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
-
-        let builder = embassy_usb::Builder::new(
-            driver,
-            config,
-            CONFIG_DESCRIPTOR.init([0; 256]),
-            BOS_DESCRIPTOR.init([0; 256]),
-            MSOS_DESCRIPTOR.init([0; 256]), // no msos descriptors
-            CONTROL_BUF.init([0; 64]),
-        );
-        builder
-    };
-
-    // Add the Microsoft OS Descriptor (MSOS/MOD) descriptor.
-    // We tell Windows that this entire device is compatible with the "WINUSB" feature,
-    // which causes it to use the built-in WinUSB driver automatically, which in turn
-    // can be used by libusb/rusb software without needing a custom driver or INF file.
-    // In principle you might want to call msos_feature() just on a specific function,
-    // if your device also has other functions that still use standard class drivers.
-    builder.msos_descriptor(windows_version::WIN8_1, 0);
-    builder.msos_feature(msos::CompatibleIdFeatureDescriptor::new("WINUSB", ""));
-    builder.msos_feature(msos::RegistryPropertyFeatureDescriptor::new(
-        "DeviceInterfaceGUIDs",
-        msos::PropertyData::RegMultiSz(DEVICE_INTERFACE_GUIDS),
-    ));
-
-    picotool.configure(&mut builder);
-
-    // Build the builder.
-    let usb = builder.build();
-
-    // Spawned tasks run in the background, concurrently.
-    spawner.spawn(usb_task(usb)).unwrap();
+    // The second core is started right away and owns the USB device. This core masks all
+    // interrupts as soon as a game is running, so USB can only stay alive over there.
+    let usb_peripheral = p.USB;
+    spawn_core1(
+        p.CORE1,
+        unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
+        move || {
+            let executor1 = EXECUTOR1.init(Executor::new());
+            executor1.run(|spawner| {
+                unwrap!(spawner.spawn(core1_main(spawner, usb_peripheral, serial)));
+            });
+        },
+    );
 
     #[rustfmt::skip]
     let gb_pio_pins = GbPioPins::new(
@@ -608,30 +588,22 @@ async fn main(spawner: Spawner) {
     };
 
     if rom_info.ram_bank_count > 0 || rom_info.has_rtc {
-        spawn_core1(
-            p.CORE1,
-            unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
-            move || {
-                let executor1 = EXECUTOR1.init(Executor::new());
-                let gb_save_ram = unsafe {
-                    core::slice::from_raw_parts(
-                        ptr::addr_of!(_s_gb_save_ram) as *mut u8,
-                        rom_info.ram_bank_count as usize * 0x2000usize,
-                    )
-                };
-                executor1.run(|spawner| {
-                    unwrap!(spawner.spawn(core1_task(
-                        p.PIN_4.into(),
-                        ws2812,
-                        volume_mgr,
-                        rom_info,
-                        gb_save_ram,
-                        rtc,
-                        gb_rtc_stateprovider,
-                    )))
-                });
-            },
-        );
+        let rom_info: &'static RomInfo = rom_info;
+        let saveram_memory = unsafe {
+            core::slice::from_raw_parts(
+                ptr::addr_of!(_s_gb_save_ram) as *mut u8,
+                rom_info.ram_bank_count as usize * 0x2000usize,
+            )
+        };
+        GAME_SERVICES.signal(GameServices {
+            button_pin: p.PIN_4.into(),
+            led: ws2812,
+            volume_mgr,
+            rom_info,
+            saveram_memory,
+            rtc,
+            rtc_state_provider: gb_rtc_stateprovider,
+        });
     }
 
     let _hyperram_gb_dma = GbReadSniffDmaConfig::new(
@@ -648,6 +620,8 @@ async fn main(spawner: Spawner) {
 
     gb_rom_higher_pio.start();
 
+    GAME_RUNNING.store(true, Ordering::Release);
+
     cortex_m::interrupt::disable();
 
     reset_pin.set_low();
@@ -661,6 +635,101 @@ async fn main(spawner: Spawner) {
     }
 }
 
+/// Entry task of the second core.
+///
+/// The USB device is created here and not on the first core, so its interrupt gets enabled
+/// in the NVIC of this core. The first core masks all interrupts while a game is running,
+/// everything which has to stay responsive during a game needs to live on this core.
+#[embassy_executor::task]
+async fn core1_main(spawner: Spawner, usb: Peri<'static, USB>, serial: &'static str) {
+    // Create the driver, from the HAL.
+    let driver = Driver::new(usb, Irqs);
+
+    // Create embassy-usb Config
+    // Create a USB device RPI Vendor ID and on of these Product ID:
+    // https://github.com/raspberrypi/picotool/blob/master/picoboot_connection/picoboot_connection.c#L23-L27
+    let mut config = Config::new(0x2e8a, 0x0009);
+    config.manufacturer = Some("Croco");
+    config.product = Some("Cartridge V2");
+    config.serial_number = Some(serial);
+    config.max_power = 100;
+    config.max_packet_size_0 = 64;
+
+    // // Required for windows compatibility.
+    // // https://developer.nordicsemi.com/nRF_Connect_SDK/doc/1.9.1/kconfig/CONFIG_CDC_ACM_IAD.html#help
+    config.device_class = 0xEF;
+    config.device_sub_class = 0x02;
+    config.device_protocol = 0x01;
+    config.composite_with_iads = true;
+
+    let picotool = {
+        static PICOTOOL: StaticCell<PicotoolReset> = StaticCell::new();
+        let picotool = PicotoolReset::new();
+        PICOTOOL.init(picotool)
+    };
+
+    // Create embassy-usb DeviceBuilder using the driver and config.
+    // It needs some buffers for building the descriptors.
+    let mut builder = {
+        static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+        static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+        static MSOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+        static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+
+        let builder = embassy_usb::Builder::new(
+            driver,
+            config,
+            CONFIG_DESCRIPTOR.init([0; 256]),
+            BOS_DESCRIPTOR.init([0; 256]),
+            MSOS_DESCRIPTOR.init([0; 256]), // no msos descriptors
+            CONTROL_BUF.init([0; 64]),
+        );
+        builder
+    };
+
+    // Add the Microsoft OS Descriptor (MSOS/MOD) descriptor.
+    // We tell Windows that this entire device is compatible with the "WINUSB" feature,
+    // which causes it to use the built-in WinUSB driver automatically, which in turn
+    // can be used by libusb/rusb software without needing a custom driver or INF file.
+    // In principle you might want to call msos_feature() just on a specific function,
+    // if your device also has other functions that still use standard class drivers.
+    builder.msos_descriptor(windows_version::WIN8_1, 0);
+    builder.msos_feature(msos::CompatibleIdFeatureDescriptor::new("WINUSB", ""));
+    builder.msos_feature(msos::RegistryPropertyFeatureDescriptor::new(
+        "DeviceInterfaceGUIDs",
+        msos::PropertyData::RegMultiSz(DEVICE_INTERFACE_GUIDS),
+    ));
+
+    picotool.configure(&mut builder);
+
+    // Serial port for the host tether. It stays usable while a game is running.
+    let tether = {
+        static TETHER_STATE: StaticCell<CdcAcmState> = StaticCell::new();
+        CdcAcmClass::new(&mut builder, TETHER_STATE.init(CdcAcmState::new()), 64)
+    };
+
+    // Build the builder.
+    let usb = builder.build();
+
+    // Spawned tasks run in the background, concurrently.
+    spawner.spawn(usb_task(usb)).unwrap();
+    spawner.spawn(tether_task(tether)).unwrap();
+
+    // Wait until a ROM with savegame or RTC got selected on the first core.
+    let services = GAME_SERVICES.wait().await;
+    spawner
+        .spawn(core1_task(
+            services.button_pin,
+            services.led,
+            services.volume_mgr,
+            services.rom_info,
+            services.saveram_memory,
+            services.rtc,
+            services.rtc_state_provider,
+        ))
+        .unwrap();
+}
+
 // Declare async tasks
 type MyUsbDriver = Driver<'static, USB>;
 type MyUsbDevice = UsbDevice<'static, MyUsbDriver>;
@@ -668,6 +737,53 @@ type MyUsbDevice = UsbDevice<'static, MyUsbDriver>;
 #[embassy_executor::task]
 async fn usb_task(mut usb: MyUsbDevice) -> ! {
     usb.run().await
+}
+
+/// Minimal host tether over the USB serial port. Every received byte is one command:
+///
+/// * `p` answers `pong`
+/// * `v` answers the tether protocol version
+/// * `s` answers `menu` or `game`, depending on what the first core is doing
+///
+/// No timers are used in here on purpose. The timer interrupt is handled on the first core
+/// and does not fire anymore once a game is running.
+#[embassy_executor::task]
+async fn tether_task(mut class: CdcAcmClass<'static, MyUsbDriver>) -> ! {
+    let mut buf = [0u8; 64];
+
+    loop {
+        class.wait_connection().await;
+        info!("tether connected");
+
+        'connection: loop {
+            let len = match class.read_packet(&mut buf).await {
+                Ok(len) => len,
+                Err(_) => break 'connection,
+            };
+
+            for command in &buf[..len] {
+                let reply: &[u8] = match *command {
+                    b'p' => b"pong\n",
+                    b'v' => b"croco-v2 tether 1\n",
+                    b's' => {
+                        if GAME_RUNNING.load(Ordering::Acquire) {
+                            b"game\n"
+                        } else {
+                            b"menu\n"
+                        }
+                    }
+                    b'\r' | b'\n' => continue,
+                    _ => b"?\n",
+                };
+
+                if class.write_packet(reply).await.is_err() {
+                    break 'connection;
+                }
+            }
+        }
+
+        info!("tether disconnected");
+    }
 }
 
 #[embassy_executor::task]
